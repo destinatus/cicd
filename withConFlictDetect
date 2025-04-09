@@ -1,0 +1,1117 @@
+// Jenkinsfile for a fully automated CI/CD pipeline with proper hotfix handling for GitLab
+// Includes versioning and tagging strategy for Node.js/React repositories
+// Implements deployment signaling via tags
+pipeline {
+    agent any
+    
+    environment {
+        // Extract branch name from environment variables
+        BRANCH_NAME = "${env.BRANCH_NAME}"
+        DEV_BRANCH_PATTERN = "dev/\\d{2}q\\dr\\d+" // Matches dev/25q1r1, etc.
+        RELEASE_BRANCH_PATTERN = "release/.*"
+        HOTFIX_BRANCH_PATTERN = "hotfix/.*"
+        MASTER_BRANCH = "master"
+        LATEST_DEV_BRANCH = "" // Will be determined dynamically
+        
+        // GitLab credentials and API settings
+        GITLAB_CREDENTIALS = credentials('gitlab-credentials')
+        GITLAB_API_URL = "https://gitlab.com/api/v4"
+        GITLAB_PROJECT_ID = "your-project-id" // Replace with your GitLab project ID
+        
+        // Versioning variables
+        VERSION = ""
+        PREV_VERSION = ""
+        VERSION_UPDATED = "false"
+        
+        // Deployment tags
+        DEPLOY_TAG_DEV = "deploy/dev" // Tag to signal deployment to development
+        DEPLOY_TAG_STAGING = "deploy/staging" // Tag to signal deployment to staging
+        DEPLOY_TAG_PROD = "deploy/prod" // Tag to signal deployment to production
+        HOTFIX_COMPLETE_TAG = "hotfix/complete" // Tag to signal hotfix is complete
+        
+        // Flag to check if this run was triggered by a tag
+        IS_TAG_TRIGGERED = "false"
+        TRIGGERING_TAG = ""
+    }
+    
+    stages {
+        stage('Checkout and Setup') {
+            steps {
+                checkout scm
+                
+                script {
+                    // Check if this build was triggered by a tag
+                    def gitTags = sh(script: "git tag --points-at HEAD", returnStdout: true).trim()
+                    
+                    if (gitTags) {
+                        env.IS_TAG_TRIGGERED = "true"
+                        env.TRIGGERING_TAG = gitTags.split("\n")[0] // Use the first tag if multiple
+                        echo "Build triggered by tag: ${env.TRIGGERING_TAG}"
+                    }
+                    
+                    // Determine latest unlocked development branch
+                    sh "git fetch --all"
+                    
+                    // Get all dev branches ordered by most recent
+                    def devBranches = sh(script: "git branch -r | grep 'origin/dev/' | sort -V", returnStdout: true).trim().split("\n")
+                    
+                    if (devBranches.size() > 0) {
+                        // Loop through branches from newest to oldest to find first unlocked one
+                        for (int i = devBranches.size() - 1; i >= 0; i--) {
+                            def branch = devBranches[i].trim().replaceAll("origin/", "")
+                            
+                            // Check if branch is protected/locked using GitLab API
+                            def isProtected = sh(
+                                script: """
+                                    curl --silent --header "PRIVATE-TOKEN: ${GITLAB_CREDENTIALS_PSW}" \
+                                    "${GITLAB_API_URL}/projects/${GITLAB_PROJECT_ID}/repository/branches/${java.net.URLEncoder.encode(branch, "UTF-8")}" \
+                                    | grep -q '"protected":true'
+                                """,
+                                returnStatus: true
+                            ) == 0
+                            
+                            if (!isProtected) {
+                                env.LATEST_DEV_BRANCH = branch
+                                echo "Latest unlocked development branch detected: ${env.LATEST_DEV_BRANCH}"
+                                break
+                            }
+                        }
+                        
+                        if (env.LATEST_DEV_BRANCH == "") {
+                            echo "WARNING: No unlocked development branch found!"
+                        }
+                    } else {
+                        echo "WARNING: No development branches found!"
+                    }
+                    
+                    // Read current version from package.json
+                    if (fileExists('package.json')) {
+                        env.PREV_VERSION = sh(script: "cat package.json | grep version | head -1 | awk -F: '{ print \$2 }' | sed 's/[\",]//g' | tr -d '[[:space:]]'", returnStdout: true).trim()
+                        env.VERSION = env.PREV_VERSION
+                        echo "Current package version: ${env.VERSION}"
+                    } else {
+                        echo "WARNING: package.json not found! Version management will be skipped."
+                    }
+                }
+            }
+        }
+        
+        stage('Build and Test') {
+            steps {
+                sh 'npm ci'
+                sh 'npm test'
+            }
+        }
+        
+        stage('Version Management') {
+            when {
+                expression { return env.IS_TAG_TRIGGERED == "false" } // Skip for tag-triggered builds
+            }
+            steps {
+                script {
+                    if (fileExists('package.json')) {
+                        if (env.BRANCH_NAME == env.MASTER_BRANCH) {
+                            // Check if this is a hotfix
+                            def lastCommitMsg = sh(script: "git log -1 --pretty=%B", returnStdout: true).trim()
+                            if (lastCommitMsg.contains("Merge hotfix") || lastCommitMsg.contains("hotfix")) {
+                                // For hotfixes on master, bump patch version (1.2.3 -> 1.2.4)
+                                bumpVersion('patch')
+                            }
+                        } else if (env.BRANCH_NAME ==~ env.RELEASE_BRANCH_PATTERN) {
+                            // For release branches, bump minor version (1.2.3 -> 1.3.0)
+                            bumpVersion('minor')
+                        } else if (env.BRANCH_NAME ==~ env.HOTFIX_BRANCH_PATTERN) {
+                            // For hotfix branches, don't bump version yet - we'll do that when merging to master
+                            echo "Hotfix branch - version will be bumped when merged to master"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Branch Detection and Processing') {
+            when {
+                expression { return env.IS_TAG_TRIGGERED == "false" } // Skip for tag-triggered builds
+            }
+            steps {
+                script {
+                    if (env.BRANCH_NAME ==~ env.DEV_BRANCH_PATTERN) {
+                        echo "Processing development branch: ${env.BRANCH_NAME}"
+                        // Development branch specific steps here
+                        
+                    } else if (env.BRANCH_NAME ==~ env.RELEASE_BRANCH_PATTERN) {
+                        echo "Processing release branch: ${env.BRANCH_NAME}"
+                        // Release branch specific steps here
+                        
+                    } else if (env.BRANCH_NAME ==~ env.HOTFIX_BRANCH_PATTERN) {
+                        echo "Processing hotfix branch: ${env.BRANCH_NAME}"
+                        processingHotfix()
+                        
+                    } else if (env.BRANCH_NAME == env.MASTER_BRANCH) {
+                        echo "Processing master branch"
+                        // Check if the latest commit was a hotfix
+                        def lastCommitMsg = sh(script: "git log -1 --pretty=%B", returnStdout: true).trim()
+                        if (lastCommitMsg.contains("Merge hotfix") || lastCommitMsg.contains("hotfix")) {
+                            echo "Detected hotfix in master, checking against latest dev branch"
+                            createHotfixMergeRequestIfNeeded()
+                        }
+                    } else {
+                        echo "Branch type not recognized: ${env.BRANCH_NAME}"
+                    }
+                }
+            }
+        }
+        
+        stage('Tag and Publish') {
+            when {
+                expression { 
+                    return env.IS_TAG_TRIGGERED == "false" && 
+                           (env.BRANCH_NAME == env.MASTER_BRANCH || env.BRANCH_NAME ==~ env.RELEASE_BRANCH_PATTERN) && 
+                           env.VERSION_UPDATED == 'true'
+                }
+            }
+            steps {
+                script {
+                    // Create and push git tag for the version update
+                    sh """
+                        git config user.name "Jenkins CI"
+                        git config user.email "jenkins@example.com"
+                        git tag -a v${env.VERSION} -m "Version ${env.VERSION} - automated tag by Jenkins"
+                        git push origin v${env.VERSION}
+                    """
+                    
+                    echo "Created and pushed tag v${env.VERSION}"
+                    
+                    // Optional: Publish to npm registry if needed
+                    // sh "npm publish"
+                }
+            }
+        }
+        
+        stage('Deployment Signal Processing') {
+            when {
+                expression { return env.IS_TAG_TRIGGERED == "true" }
+            }
+            steps {
+                script {
+                    echo "Processing deployment signal tag: ${env.TRIGGERING_TAG}"
+                    
+                    // Process the tag based on its name
+                    if (env.TRIGGERING_TAG == env.DEPLOY_TAG_DEV) {
+                        deployToDevelopment()
+                        
+                    } else if (env.TRIGGERING_TAG == env.DEPLOY_TAG_STAGING) {
+                        deployToStaging()
+                        
+                    } else if (env.TRIGGERING_TAG == env.DEPLOY_TAG_PROD) {
+                        deployToProduction()
+                        
+                    } else if (env.TRIGGERING_TAG == env.HOTFIX_COMPLETE_TAG) {
+                        markHotfixComplete()
+                        
+                    } else if (env.TRIGGERING_TAG.startsWith("v")) {
+                        echo "Version tag detected. No special action needed."
+                        
+                    } else {
+                        echo "Unrecognized tag: ${env.TRIGGERING_TAG}. No action taken."
+                    }
+                }
+            }
+        }
+        
+        stage('Normal Deploy') {
+            when {
+                expression { return env.IS_TAG_TRIGGERED == "false" }
+            }
+            steps {
+                script {
+                    if (env.BRANCH_NAME ==~ env.DEV_BRANCH_PATTERN) {
+                        echo "Build successful. To deploy to DEV, push the '${env.DEPLOY_TAG_DEV}' tag to this commit."
+                        
+                    } else if (env.BRANCH_NAME ==~ env.RELEASE_BRANCH_PATTERN) {
+                        echo "Build successful. To deploy to STAGING, push the '${env.DEPLOY_TAG_STAGING}' tag to this commit."
+                        // Release branches can also go to production
+                        echo "To deploy to PRODUCTION, push the '${env.DEPLOY_TAG_PROD}' tag to this commit."
+                        
+                    } else if (env.BRANCH_NAME == env.MASTER_BRANCH) {
+                        echo "Build successful. To deploy to PRODUCTION, push the '${env.DEPLOY_TAG_PROD}' tag to this commit."
+                        
+                    } else if (env.BRANCH_NAME ==~ env.HOTFIX_BRANCH_PATTERN) {
+                        echo "Hotfix validation successful. To mark the hotfix as complete, push the '${env.HOTFIX_COMPLETE_TAG}' tag to this commit."
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            script {
+                // If version was updated, commit the change
+                if (env.IS_TAG_TRIGGERED == "false" && env.VERSION_UPDATED == 'true') {
+                    echo "Committing version update from ${env.PREV_VERSION} to ${env.VERSION}"
+                    try {
+                        sh """
+                            git add package.json package-lock.json
+                            git commit -m "Bump version from ${env.PREV_VERSION} to ${env.VERSION} [ci skip]"
+                            git push origin ${env.BRANCH_NAME}
+                        """
+                    } catch (Exception e) {
+                        echo "Warning: Failed to commit version update: ${e.message}"
+                    }
+                }
+            }
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
+
+// Function to handle hotfix processing
+def processingHotfix() {
+    // Additional hotfix validation steps
+    echo "Running comprehensive tests for hotfix validation"
+    sh "npm run test:regression"
+    
+    // Notify team that a hotfix is being processed
+    emailext (
+        subject: "Hotfix being processed: ${env.BRANCH_NAME}",
+        body: "A hotfix is currently being processed and tested: ${env.BRANCH_NAME}.\n\nTo mark this hotfix as complete, push the '${env.HOTFIX_COMPLETE_TAG}' tag to this commit.",
+        recipientProviders: [developers(), requestor()]
+    )
+}
+
+// Function to check if a hotfix in master needs to be propagated to the latest dev branch
+def createHotfixMergeRequestIfNeeded() {
+    try {
+        if (env.LATEST_DEV_BRANCH == "") {
+            echo "No unlocked development branch found, cannot create merge request"
+            return
+        }
+        
+        // Find hotfix commits that are in master but not in the latest dev branch
+        def missingCommits = sh(
+            script: """
+                git log --grep="hotfix" --oneline ${env.LATEST_DEV_BRANCH}..${env.MASTER_BRANCH} | wc -l
+            """,
+            returnStdout: true
+        ).trim().toInteger()
+        
+        if (missingCommits > 0) {
+            echo "Found ${missingCommits} hotfix commits in master that are missing from ${env.LATEST_DEV_BRANCH}"
+            
+            // Check for potential merge conflicts before creating MR
+            def hasConflicts = checkForPotentialMergeConflicts(env.MASTER_BRANCH, env.LATEST_DEV_BRANCH)
+            
+            if (hasConflicts) {
+                echo "WARNING: Potential merge conflicts detected. Creating merge request but marking it as conflicted."
+                createMergeRequestForHotfix(missingCommits, true)
+            } else {
+                echo "No potential conflicts detected. Creating normal merge request."
+                createMergeRequestForHotfix(missingCommits, false)
+            }
+        } else {
+            echo "No missing hotfix commits detected for ${env.LATEST_DEV_BRANCH}"
+        }
+    } catch (Exception e) {
+        echo "Error checking for missing hotfix commits: ${e.message}"
+        emailext (
+            subject: "ATTENTION: Failed to check for missing hotfixes",
+            body: "An error occurred while trying to detect missing hotfix commits in the latest development branch.\nError: ${e.message}",
+            recipientProviders: [developers(), requestor()]
+        )
+    }
+}
+
+// Function to create a GitLab merge request for a hotfix
+def createMergeRequestForHotfix(int missingCommits, boolean hasConflicts) {
+    try {
+        // Create a temporary branch from master for the MR
+        def tempBranchName = "sync-hotfix-to-${env.LATEST_DEV_BRANCH.replace('/', '-')}-${System.currentTimeMillis()}"
+        
+        sh """
+            git checkout ${env.MASTER_BRANCH}
+            git checkout -b ${tempBranchName}
+            git push origin ${tempBranchName}
+        """
+        
+        // Get hotfix commit details for the MR description
+        def hotfixDetails = sh(
+            script: """
+                git log --grep="hotfix" ${env.LATEST_DEV_BRANCH}..${env.MASTER_BRANCH} --pretty=format:"%h - %s"
+            """,
+            returnStdout: true
+        ).trim()
+        
+        // Get a list of changed files in the hotfix
+        def changedFiles = sh(
+            script: """
+                git diff --name-only ${env.LATEST_DEV_BRANCH}..${env.MASTER_BRANCH}
+            """,
+            returnStdout: true
+        ).trim()
+        
+        // Create the merge request using GitLab API
+        def conflictWarning = hasConflicts ? """
+⚠️ **POTENTIAL MERGE CONFLICTS DETECTED** ⚠️
+This merge request may have conflicts that need manual resolution.
+The following files have been modified in both branches and may need attention:
+${getConflictingFilesList(env.MASTER_BRANCH, env.LATEST_DEV_BRANCH)}
+        """ : ""
+        
+        def mrTitle = hasConflicts ? 
+            "⚠️ [CONFLICTS] Apply hotfix changes to ${env.LATEST_DEV_BRANCH}" : 
+            "Apply hotfix changes to ${env.LATEST_DEV_BRANCH}"
+            
+        def mrDescription = """
+This is an automated merge request to apply recent hotfix changes from master to ${env.LATEST_DEV_BRANCH}.
+
+The following hotfix commits need to be applied:
+${hotfixDetails}
+
+${conflictWarning}
+
+**Changed files:**
+\`\`\`
+${changedFiles}
+\`\`\`
+
+**Please review carefully before merging to ensure these changes are appropriate for this development branch.**
+"""
+        
+        // URL-encode the description for the API call
+        def encodedDescription = mrDescription.replace('\n', '\\n')
+        
+        // Create the merge request
+        def response = sh(
+            script: """
+                curl --silent -X POST \
+                -H "PRIVATE-TOKEN: ${GITLAB_CREDENTIALS_PSW}" \
+                -H "Content-Type: application/json" \
+                "${GITLAB_API_URL}/projects/${GITLAB_PROJECT_ID}/merge_requests" \
+                --data '{
+                    "source_branch": "${tempBranchName}",
+                    "target_branch": "${env.LATEST_DEV_BRANCH}",
+                    "title": "${mrTitle}",
+                    "description": "${encodedDescription}",
+                    "remove_source_branch": true
+                }'
+            """,
+            returnStdout: true
+        )
+        
+        echo "Merge request created for ${env.LATEST_DEV_BRANCH}"
+        
+        // Extract MR ID and URL from response
+        def mrId = sh(
+            script: """echo '${response}' | grep -o '"iid":[0-9]*' | cut -d ':' -f 2""",
+            returnStdout: true
+        ).trim()
+        
+        def mrUrl = "${GITLAB_API_URL.replace('/api/v4', '')}/projects/${GITLAB_PROJECT_ID}/merge_requests/${mrId}"
+        
+        // Set appropriate urgency based on conflict detection
+        def subjectPrefix = hasConflicts ? "🚨 URGENT: Conflicted" : "IMPORTANT:"
+        
+        // Notify team about the new merge request
+        emailext (
+            subject: "${subjectPrefix} Hotfix MR created for ${env.LATEST_DEV_BRANCH}",
+            body: """An automated merge request has been created to apply recent hotfix changes to ${env.LATEST_DEV_BRANCH}.
+
+${hasConflicts ? "⚠️ **POTENTIAL MERGE CONFLICTS DETECTED!** This merge request may require manual conflict resolution." : ""}
+
+Merge Request URL: ${mrUrl}
+
+Please review and merge as soon as possible to ensure the fix is included in future releases.
+            """,
+            recipientProviders: [developers(), requestor()]
+        )
+    } catch (Exception e) {
+        echo "Failed to create merge request: ${e.message}"
+        emailext (
+            subject: "ATTENTION: Failed to create hotfix MR for ${env.LATEST_DEV_BRANCH}",
+            body: "Automated merge request creation failed for applying hotfix to ${env.LATEST_DEV_BRANCH}.\nError: ${e.message}\n\nPlease create this MR manually to ensure all hotfix changes from master are included.",
+            recipientProviders: [developers(), requestor()]
+        )
+    }
+}
+
+// Function to check for potential merge conflicts
+def checkForPotentialMergeConflicts(String sourceBranch, String targetBranch) {
+    try {
+        // Create a temporary merge to check for conflicts
+        def tempBranchName = "conflict-check-${System.currentTimeMillis()}"
+        
+        // Create the temp branch from the target branch
+        sh """
+            git checkout ${targetBranch}
+            git checkout -b ${tempBranchName}
+        """
+        
+        // Try to merge the source branch (master) into the temp branch
+        def mergeExitCode = sh(
+            script: """
+                git merge --no-commit --no-ff ${sourceBranch} || echo "Merge conflict detected"
+                git merge --abort || true
+                git checkout ${sourceBranch}
+                git branch -D ${tempBranchName}
+            """,
+            returnStatus: true
+        )
+        
+        // If merge exit code is not 0, there are conflicts
+        return mergeExitCode != 0
+    } catch (Exception e) {
+        echo "Error checking for merge conflicts: ${e.message}"
+        // If we hit an error, assume there might be conflicts to be safe
+        return true
+    }
+}
+
+// Function to get a list of potentially conflicting files
+def getConflictingFilesList(String sourceBranch, String targetBranch) {
+    try {
+        // Get files modified in both branches
+        def sourceFiles = sh(
+            script: """
+                git diff --name-only HEAD~10..${sourceBranch}
+            """, 
+            returnStdout: true
+        ).trim().split("\n") as Set
+        
+        def targetFiles = sh(
+            script: """
+                git diff --name-only HEAD~10..${targetBranch}
+            """, 
+            returnStdout: true
+        ).trim().split("\n") as Set
+        
+        // Find intersection of the two sets
+        def potentialConflicts = sourceFiles.intersect(targetFiles)
+        
+        if (potentialConflicts.size() > 0) {
+            return potentialConflicts.collect { "- \`${it}\`" }.join("\n")
+        } else {
+            return "No specific files identified, but there may be structural conflicts."
+        }
+    } catch (Exception e) {
+        echo "Error getting conflicting files list: ${e.message}"
+        return "Could not determine specific conflicting files."
+    }
+}
+
+// Function to perform periodic sync check between branches
+def schedulePeriodicSyncCheck() {
+    try {
+        // This would typically be triggered by a cron job in Jenkins
+        echo "Running periodic branch sync check"
+        
+        // Check if development branch is diverging too much from master
+        def commitsBehind = sh(
+            script: """
+                git fetch --all
+                git log --oneline ${env.LATEST_DEV_BRANCH}..${env.MASTER_BRANCH} | wc -l
+            """,
+            returnStdout: true
+        ).trim().toInteger()
+        
+        if (commitsBehind > 10) {
+            // Alert if branches are diverging significantly
+            emailext (
+                subject: "⚠️ WARNING: Development branch diverging from master",
+                body: """The current development branch ${env.LATEST_DEV_BRANCH} is ${commitsBehind} commits behind master.
+
+This increases the risk of difficult merge conflicts in the future. Consider syncing the branches soon to prevent issues.
+                """,
+                recipientProviders: [developers(), requestor()]
+            )
+        }
+    } catch (Exception e) {
+        echo "Error in periodic sync check: ${e.message}"
+    }
+}
+
+// Function to bump version in package.json
+def bumpVersion(String releaseType) {
+    try {
+        // Parse current version
+        def (major, minor, patch) = env.VERSION.tokenize('.')
+        
+        // Calculate new version based on release type
+        if (releaseType == 'major') {
+            major = major.toInteger() + 1
+            minor = 0
+            patch = 0
+        } else if (releaseType == 'minor') {
+            minor = minor.toInteger() + 1
+            patch = 0
+        } else if (releaseType == 'patch') {
+            patch = patch.toInteger() + 1
+        }
+        
+        def newVersion = "${major}.${minor}.${patch}"
+        
+        // Only proceed if version is actually changing
+        if (newVersion != env.VERSION) {
+            echo "Updating version from ${env.VERSION} to ${newVersion}"
+            
+            // Update version in package.json
+            sh """
+                sed -i 's/"version": "${env.VERSION}"/"version": "${newVersion}"/g' package.json
+            """
+            
+            // Update package-lock.json if it exists
+            if (fileExists('package-lock.json')) {
+                sh """
+                    sed -i 's/"version": "${env.VERSION}"/"version": "${newVersion}"/g' package-lock.json
+                """
+            }
+            
+            env.VERSION = newVersion
+            env.VERSION_UPDATED = 'true'
+        } else {
+            echo "Version remains at ${env.VERSION} (no change needed)"
+        }
+    } catch (Exception e) {
+        echo "Error bumping version: ${e.message}"
+        // Continue with pipeline even if version bump fails
+    }
+}
+
+    // Deployment functions triggered by tags
+def deployToDevelopment() {
+    echo "Deploying to DEVELOPMENT environment"
+    
+    // Get commit info for notification
+    def commitHash = sh(script: "git rev-parse HEAD", returnStdout: true).trim()
+    def commitMsg = sh(script: "git log -1 --pretty=%B", returnStdout: true).trim()
+    def commitAuthor = sh(script: "git log -1 --pretty=%an", returnStdout: true).trim()
+    def branchName = sh(script: "git rev-parse --abbrev-ref HEAD", returnStdout: true).trim()
+    
+    try {
+        // Verify we're on a development branch
+        if (!(branchName ==~ env.DEV_BRANCH_PATTERN)) {
+            throw new Exception("Cannot deploy to DEVELOPMENT from branch '${branchName}'. Only development branches can be deployed to the development environment.")
+        }
+        
+        // Run the actual deployment steps
+        sh """
+            npm ci
+            npm run build
+            # Add your deployment commands here, e.g.:
+            # rsync -avz --delete ./build/ user@dev-server:/var/www/html/
+        """
+        
+        // Send success notification
+        emailext (
+            subject: "✅ Deployment to DEV successful",
+            body: """Successfully deployed to DEVELOPMENT environment:
+            
+Commit: ${commitHash}
+Author: ${commitAuthor}
+Message: ${commitMsg}
+Branch: ${branchName}
+
+The deployment was triggered by the ${env.DEPLOY_TAG_DEV} tag.
+            """,
+            recipientProviders: [developers(), requestor()]
+        )
+        
+        // Delete the deployment tag after successful deployment
+        sh """
+            git push origin :refs/tags/${env.DEPLOY_TAG_DEV}
+        """
+        
+    } catch (Exception e) {
+        echo "Deployment to DEV failed: ${e.message}"
+        emailext (
+            subject: "❌ Deployment to DEV failed",
+            body: """Deployment to DEVELOPMENT environment failed:
+            
+Commit: ${commitHash}
+Author: ${commitAuthor}
+Message: ${commitMsg}
+Branch: ${branchName}
+
+Error: ${e.message}
+
+The deployment was triggered by the ${env.DEPLOY_TAG_DEV} tag but encountered errors.
+            """,
+            recipientProviders: [developers(), requestor()]
+        )
+        throw e
+    }
+}
+
+def deployToStaging() {
+    echo "Deploying to STAGING environment"
+    
+    // Get commit info for notification
+    def commitHash = sh(script: "git rev-parse HEAD", returnStdout: true).trim()
+    def commitMsg = sh(script: "git log -1 --pretty=%B", returnStdout: true).trim()
+    def commitAuthor = sh(script: "git log -1 --pretty=%an", returnStdout: true).trim()
+    def branchName = sh(script: "git rev-parse --abbrev-ref HEAD", returnStdout: true).trim()
+    
+    try {
+        // Verify we're on a release branch
+        if (!(branchName ==~ env.RELEASE_BRANCH_PATTERN)) {
+            throw new Exception("Cannot deploy to STAGING from branch '${branchName}'. Only release branches can be deployed to the staging environment.")
+        }
+        
+        // Run the actual deployment steps
+        sh """
+            npm ci
+            npm run build
+            # Add your deployment commands here, e.g.:
+            # rsync -avz --delete ./build/ user@staging-server:/var/www/html/
+        """
+        
+        // Send success notification
+        emailext (
+            subject: "✅ Deployment to STAGING successful",
+            body: """Successfully deployed to STAGING environment:
+            
+Commit: ${commitHash}
+Author: ${commitAuthor}
+Message: ${commitMsg}
+Branch: ${branchName}
+
+The deployment was triggered by the ${env.DEPLOY_TAG_STAGING} tag.
+            """,
+            recipientProviders: [developers(), requestor()]
+        )
+        
+        // Delete the deployment tag after successful deployment
+        sh """
+            git push origin :refs/tags/${env.DEPLOY_TAG_STAGING}
+        """
+        
+    } catch (Exception e) {
+        echo "Deployment to STAGING failed: ${e.message}"
+        emailext (
+            subject: "❌ Deployment to STAGING failed",
+            body: """Deployment to STAGING environment failed:
+            
+Commit: ${commitHash}
+Author: ${commitAuthor}
+Message: ${commitMsg}
+Branch: ${branchName}
+
+Error: ${e.message}
+
+The deployment was triggered by the ${env.DEPLOY_TAG_STAGING} tag but encountered errors.
+            """,
+            recipientProviders: [developers(), requestor()]
+        )
+        throw e
+    }
+}
+
+def deployToProduction() {
+    echo "Deploying to PRODUCTION environment"
+    
+    // Get commit info for notification
+    def commitHash = sh(script: "git rev-parse HEAD", returnStdout: true).trim()
+    def commitMsg = sh(script: "git log -1 --pretty=%B", returnStdout: true).trim()
+    def commitAuthor = sh(script: "git log -1 --pretty=%an", returnStdout: true).trim()
+    def branchName = sh(script: "git rev-parse --abbrev-ref HEAD", returnStdout: true).trim()
+    
+    try {
+        // Verify we're on either master or a release branch
+        if (branchName != env.MASTER_BRANCH && !(branchName ==~ env.RELEASE_BRANCH_PATTERN)) {
+            throw new Exception("Cannot deploy to PRODUCTION from branch '${branchName}'. Only master or release branches can be deployed to the production environment.")
+        }
+        
+        // Run the actual deployment steps
+        sh """
+            npm ci
+            npm run build
+            # Add your deployment commands here, e.g.:
+            # rsync -avz --delete ./build/ user@prod-server:/var/www/html/
+        """
+        
+        // Send success notification
+        emailext (
+            subject: "✅ Deployment to PRODUCTION successful",
+            body: """Successfully deployed to PRODUCTION environment:
+            
+Commit: ${commitHash}
+Author: ${commitAuthor}
+Message: ${commitMsg}
+Branch: ${branchName}
+
+The deployment was triggered by the ${env.DEPLOY_TAG_PROD} tag.
+            """,
+            recipientProviders: [developers(), requestor()]
+        )
+        
+        // Delete the deployment tag after successful deployment
+        sh """
+            git push origin :refs/tags/${env.DEPLOY_TAG_PROD}
+        """
+        
+    } catch (Exception e) {
+        echo "Deployment to PRODUCTION failed: ${e.message}"
+        emailext (
+            subject: "❌ Deployment to PRODUCTION failed",
+            body: """Deployment to PRODUCTION environment failed:
+            
+Commit: ${commitHash}
+Author: ${commitAuthor}
+Message: ${commitMsg}
+Branch: ${branchName}
+
+Error: ${e.message}
+
+The deployment was triggered by the ${env.DEPLOY_TAG_PROD} tag but encountered errors.
+            """,
+            recipientProviders: [developers(), requestor()]
+        )
+        throw e
+    }
+}
+
+def markHotfixComplete() {
+    echo "Marking hotfix as complete"
+    
+    // Get commit info for notification
+    def commitHash = sh(script: "git rev-parse HEAD", returnStdout: true).trim()
+    def branchName = sh(script: "git rev-parse --abbrev-ref HEAD", returnStdout: true).trim()
+    
+    try {
+        // Make sure we're on a hotfix branch
+        if (!(branchName ==~ env.HOTFIX_BRANCH_PATTERN)) {
+            throw new Exception("The hotfix/complete tag can only be applied to hotfix branches. Current branch: ${branchName}")
+        }
+        
+        // Update GitLab API to mark the branch as protected/locked
+        sh """
+            curl --request PUT \
+            --header "PRIVATE-TOKEN: ${GITLAB_CREDENTIALS_PSW}" \
+            --header "Content-Type: application/json" \
+            "${GITLAB_API_URL}/projects/${GITLAB_PROJECT_ID}/repository/branches/${java.net.URLEncoder.encode(branchName, "UTF-8")}/protect" \
+            --data '{
+                "developers_can_push": false,
+                "developers_can_merge": false
+            }'
+        """
+        
+        // Send notification that hotfix is ready for review and merge
+        emailext (
+            subject: "🔒 Hotfix branch ${branchName} marked as complete",
+            body: """The hotfix branch ${branchName} has been marked as complete and is now protected.
+
+This branch is ready for code review and can be merged to master.
+
+Commit: ${commitHash}
+
+The branch was locked by applying the ${env.HOTFIX_COMPLETE_TAG} tag.
+            """,
+            recipientProviders: [developers(), requestor()]
+        )
+        
+        // Delete the tag after processing
+        sh """
+            git push origin :refs/tags/${env.HOTFIX_COMPLETE_TAG}
+        """
+        
+    } catch (Exception e) {
+        echo "Failed to mark hotfix as complete: ${e.message}"
+        emailext (
+            subject: "❌ Failed to mark hotfix as complete",
+            body: """Failed to mark the hotfix branch as complete:
+
+Branch: ${branchName}
+Error: ${e.message}
+
+The operation was triggered by the ${env.HOTFIX_COMPLETE_TAG} tag but encountered errors.
+            """,
+            recipientProviders: [developers(), requestor()]
+        )
+        throw e
+    }
+}// For hotfixes on master, bump patch version (1.2.3 -> 1.2.4)
+                                bumpVersion('patch')
+                            }
+                        } else if (env.BRANCH_NAME ==~ env.RELEASE_BRANCH_PATTERN) {
+                            // For release branches, bump minor version (1.2.3 -> 1.3.0)
+                            bumpVersion('minor')
+                        } else if (env.BRANCH_NAME ==~ env.HOTFIX_BRANCH_PATTERN) {
+                            // For hotfix branches, don't bump version yet - we'll do that when merging to master
+                            echo "Hotfix branch - version will be bumped when merged to master"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Branch Detection and Processing') {
+            steps {
+                script {
+                    if (env.BRANCH_NAME ==~ env.DEV_BRANCH_PATTERN) {
+                        echo "Processing development branch: ${env.BRANCH_NAME}"
+                        // Development branch specific steps here
+                        
+                    } else if (env.BRANCH_NAME ==~ env.RELEASE_BRANCH_PATTERN) {
+                        echo "Processing release branch: ${env.BRANCH_NAME}"
+                        // Release branch specific steps here
+                        
+                    } else if (env.BRANCH_NAME ==~ env.HOTFIX_BRANCH_PATTERN) {
+                        echo "Processing hotfix branch: ${env.BRANCH_NAME}"
+                        processingHotfix()
+                        
+                    } else if (env.BRANCH_NAME == env.MASTER_BRANCH) {
+                        echo "Processing master branch"
+                        // Check if the latest commit was a hotfix
+                        def lastCommitMsg = sh(script: "git log -1 --pretty=%B", returnStdout: true).trim()
+                        if (lastCommitMsg.contains("Merge hotfix") || lastCommitMsg.contains("hotfix")) {
+                            echo "Detected hotfix in master, checking against latest dev branch"
+                            createHotfixMergeRequestIfNeeded()
+                        }
+                    } else {
+                        echo "Branch type not recognized: ${env.BRANCH_NAME}"
+                    }
+                }
+            }
+        }
+        
+        stage('Tag and Publish') {
+            when {
+                expression { 
+                    return (env.BRANCH_NAME == env.MASTER_BRANCH || env.BRANCH_NAME ==~ env.RELEASE_BRANCH_PATTERN) && env.VERSION_UPDATED == 'true'
+                }
+            }
+            steps {
+                script {
+                    // Create and push git tag
+                    sh """
+                        git config user.name "Jenkins CI"
+                        git config user.email "jenkins@example.com"
+                        git tag -a v${env.VERSION} -m "Version ${env.VERSION} - automated tag by Jenkins"
+                        git push origin v${env.VERSION}
+                    """
+                    
+                    echo "Created and pushed tag v${env.VERSION}"
+                    
+                    // Optional: Publish to npm registry if needed
+                    // sh "npm publish"
+                }
+            }
+        }
+        
+        stage('Deploy') {
+            steps {
+                script {
+                    if (env.BRANCH_NAME ==~ env.DEV_BRANCH_PATTERN) {
+                        echo "Deploying to DEV environment"
+                        // Deploy to dev
+                    } else if (env.BRANCH_NAME ==~ env.RELEASE_BRANCH_PATTERN) {
+                        echo "Deploying to QA/UAT environment"
+                        // Deploy to QA/UAT
+                    } else if (env.BRANCH_NAME == env.MASTER_BRANCH) {
+                        echo "Deploying to PRODUCTION environment"
+                        // Deploy to production
+                    } else if (env.BRANCH_NAME ==~ env.HOTFIX_BRANCH_PATTERN) {
+                        echo "Deploying hotfix to TEST environment"
+                        // Deploy to test environment for verification
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            script {
+                // If version was updated, commit the change
+                if (env.VERSION_UPDATED == 'true') {
+                    echo "Committing version update from ${env.PREV_VERSION} to ${env.VERSION}"
+                    try {
+                        sh """
+                            git add package.json package-lock.json
+                            git commit -m "Bump version from ${env.PREV_VERSION} to ${env.VERSION} [ci skip]"
+                            git push origin ${env.BRANCH_NAME}
+                        """
+                    } catch (Exception e) {
+                        echo "Warning: Failed to commit version update: ${e.message}"
+                    }
+                }
+            }
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
+
+// Function to handle hotfix processing
+def processingHotfix() {
+    // Additional hotfix validation steps
+    echo "Running comprehensive tests for hotfix validation"
+    sh "npm run test:regression"
+    
+    // Notify team that a hotfix is being processed
+    emailext (
+        subject: "Hotfix being processed: ${env.BRANCH_NAME}",
+        body: "A hotfix is currently being processed and tested: ${env.BRANCH_NAME}",
+        recipientProviders: [developers(), requestor()]
+    )
+}
+
+// Function to check if a hotfix in master needs to be propagated to the latest dev branch
+def createHotfixMergeRequestIfNeeded() {
+    try {
+        if (env.LATEST_DEV_BRANCH == "") {
+            echo "No unlocked development branch found, cannot create merge request"
+            return
+        }
+        
+        // Find hotfix commits that are in master but not in the latest dev branch
+        def missingCommits = sh(
+            script: """
+                git log --grep="hotfix" --oneline ${env.LATEST_DEV_BRANCH}..${env.MASTER_BRANCH} | wc -l
+            """,
+            returnStdout: true
+        ).trim().toInteger()
+        
+        if (missingCommits > 0) {
+            echo "Found ${missingCommits} hotfix commits in master that are missing from ${env.LATEST_DEV_BRANCH}"
+            createMergeRequestForHotfix(missingCommits)
+        } else {
+            echo "No missing hotfix commits detected for ${env.LATEST_DEV_BRANCH}"
+        }
+    } catch (Exception e) {
+        echo "Error checking for missing hotfix commits: ${e.message}"
+        emailext (
+            subject: "ATTENTION: Failed to check for missing hotfixes",
+            body: "An error occurred while trying to detect missing hotfix commits in the latest development branch.\nError: ${e.message}",
+            recipientProviders: [developers(), requestor()]
+        )
+    }
+}
+
+// Function to create a GitLab merge request for a hotfix
+def createMergeRequestForHotfix(int missingCommits) {
+    try {
+        // Create a temporary branch from master for the MR
+        def tempBranchName = "sync-hotfix-to-${env.LATEST_DEV_BRANCH.replace('/', '-')}-${System.currentTimeMillis()}"
+        
+        sh """
+            git checkout ${env.MASTER_BRANCH}
+            git checkout -b ${tempBranchName}
+            git push origin ${tempBranchName}
+        """
+        
+        // Get hotfix commit details for the MR description
+        def hotfixDetails = sh(
+            script: """
+                git log --grep="hotfix" ${env.LATEST_DEV_BRANCH}..${env.MASTER_BRANCH} --pretty=format:"%h - %s"
+            """,
+            returnStdout: true
+        ).trim()
+        
+        // Create the merge request using GitLab API
+        def mrTitle = "Apply hotfix changes to ${env.LATEST_DEV_BRANCH}"
+        def mrDescription = """
+This is an automated merge request to apply recent hotfix changes from master to ${env.LATEST_DEV_BRANCH}.
+
+The following hotfix commits need to be applied:
+${hotfixDetails}
+
+**Please review carefully before merging to ensure these changes are appropriate for this development branch.**
+"""
+        
+        // URL-encode the description for the API call
+        def encodedDescription = mrDescription.replace('\n', '\\n')
+        
+        // Create the merge request
+        def response = sh(
+            script: """
+                curl --silent -X POST \
+                -H "PRIVATE-TOKEN: ${GITLAB_CREDENTIALS_PSW}" \
+                -H "Content-Type: application/json" \
+                "${GITLAB_API_URL}/projects/${GITLAB_PROJECT_ID}/merge_requests" \
+                --data '{
+                    "source_branch": "${tempBranchName}",
+                    "target_branch": "${env.LATEST_DEV_BRANCH}",
+                    "title": "${mrTitle}",
+                    "description": "${encodedDescription}",
+                    "remove_source_branch": true
+                }'
+            """,
+            returnStdout: true
+        )
+        
+        echo "Merge request created for ${env.LATEST_DEV_BRANCH}"
+        
+        // Extract MR ID and URL from response
+        def mrId = sh(
+            script: """echo '${response}' | grep -o '"iid":[0-9]*' | cut -d ':' -f 2""",
+            returnStdout: true
+        ).trim()
+        
+        def mrUrl = "${GITLAB_API_URL.replace('/api/v4', '')}/projects/${GITLAB_PROJECT_ID}/merge_requests/${mrId}"
+        
+        // Notify team about the new merge request
+        emailext (
+            subject: "IMPORTANT: Hotfix MR created for ${env.LATEST_DEV_BRANCH}",
+            body: "An automated merge request has been created to apply recent hotfix changes to ${env.LATEST_DEV_BRANCH}.\n\nMerge Request URL: ${mrUrl}\n\nPlease review and merge as soon as possible to ensure the fix is included in future releases.",
+            recipientProviders: [developers(), requestor()]
+        )
+    } catch (Exception e) {
+        echo "Failed to create merge request: ${e.message}"
+        emailext (
+            subject: "ATTENTION: Failed to create hotfix MR for ${env.LATEST_DEV_BRANCH}",
+            body: "Automated merge request creation failed for applying hotfix to ${env.LATEST_DEV_BRANCH}.\nError: ${e.message}\n\nPlease create this MR manually to ensure all hotfix changes from master are included.",
+            recipientProviders: [developers(), requestor()]
+        )
+    }
+}
+
+// Function to bump version in package.json
+def bumpVersion(String releaseType) {
+    try {
+        // Parse current version
+        def (major, minor, patch) = env.VERSION.tokenize('.')
+        
+        // Calculate new version based on release type
+        if (releaseType == 'major') {
+            major = major.toInteger() + 1
+            minor = 0
+            patch = 0
+        } else if (releaseType == 'minor') {
+            minor = minor.toInteger() + 1
+            patch = 0
+        } else if (releaseType == 'patch') {
+            patch = patch.toInteger() + 1
+        }
+        
+        def newVersion = "${major}.${minor}.${patch}"
+        
+        // Only proceed if version is actually changing
+        if (newVersion != env.VERSION) {
+            echo "Updating version from ${env.VERSION} to ${newVersion}"
+            
+            // Update version in package.json
+            sh """
+                sed -i 's/"version": "${env.VERSION}"/"version": "${newVersion}"/g' package.json
+            """
+            
+            // Update package-lock.json if it exists
+            if (fileExists('package-lock.json')) {
+                sh """
+                    sed -i 's/"version": "${env.VERSION}"/"version": "${newVersion}"/g' package-lock.json
+                """
+            }
+            
+            env.VERSION = newVersion
+            env.VERSION_UPDATED = 'true'
+        } else {
+            echo "Version remains at ${env.VERSION} (no change needed)"
+        }
+    } catch (Exception e) {
+        echo "Error bumping version: ${e.message}"
+        // Continue with pipeline even if version bump fails
+    }
+}
