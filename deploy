@@ -1,0 +1,455 @@
+// Jenkinsfile for a fully automated CI/CD pipeline with proper branch management
+pipeline {
+    agent any
+    
+    environment {
+        // Extract branch name from environment variables
+        BRANCH_NAME = "${env.BRANCH_NAME}"
+        DEV_BRANCH_PATTERN = "d\\d+" // Matches d1, d2, etc.
+        RELEASE_BRANCH_PATTERN = "r\\d+" // Matches r1, r2, etc.
+        HOTFIX_BRANCH_PATTERN = "hotfix/.*"
+        MASTER_BRANCH = "master"
+        CURRENT_DEV_BRANCH = "" // Will be determined dynamically
+        PARENT_RELEASE_BRANCH = "" // Will be determined for hotfixes
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                
+                // Determine current development branch and parent release branch if needed
+                script {
+                    sh "git fetch --all"
+                    
+                    // Find latest development branch
+                    def devBranches = sh(script: "git branch -r | grep 'origin/d' | sort -V", returnStdout: true).trim()
+                    def latestDevBranch = sh(script: "echo '${devBranches}' | tail -n 1 | sed 's/origin\\///'", returnStdout: true).trim()
+                    env.CURRENT_DEV_BRANCH = latestDevBranch
+                    echo "Current development branch detected: ${env.CURRENT_DEV_BRANCH}"
+                    
+                    // If this is a hotfix branch, determine the parent release branch
+                    if (env.BRANCH_NAME ==~ env.HOTFIX_BRANCH_PATTERN) {
+                        // Extract release branch info from hotfix branch name
+                        // Assuming hotfix format like "hotfix/r1-fix-description"
+                        def hotfixNameParts = env.BRANCH_NAME.split('/')
+                        if (hotfixNameParts.length > 1) {
+                            def hotfixName = hotfixNameParts[1]
+                            // Check if the hotfix name contains release info
+                            def releaseMatcher = hotfixName =~ /(r\d+)/
+                            if (releaseMatcher.find()) {
+                                env.PARENT_RELEASE_BRANCH = releaseMatcher.group(1)
+                                echo "Parent release branch detected: ${env.PARENT_RELEASE_BRANCH}"
+                            } else {
+                                // If not specified in hotfix name, find the latest active release branch
+                                def releaseBranches = sh(script: "git branch -r | grep 'origin/r' | sort -V", returnStdout: true).trim()
+                                def latestReleaseBranch = sh(script: "echo '${releaseBranches}' | tail -n 1 | sed 's/origin\\///'", returnStdout: true).trim()
+                                env.PARENT_RELEASE_BRANCH = latestReleaseBranch
+                                echo "No release specified in hotfix name. Using latest release branch: ${env.PARENT_RELEASE_BRANCH}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Build and Test') {
+            steps {
+                sh 'mvn clean verify' // Replace with your build command
+            }
+        }
+        
+        stage('Check Completion Tag') {
+            steps {
+                script {
+                    if (env.BRANCH_NAME ==~ env.DEV_BRANCH_PATTERN) {
+                        // Check if development branch is tagged as complete
+                        def isTagged = sh(script: "git tag -l | grep '${env.BRANCH_NAME}-complete'", returnStatus: true) == 0
+                        if (!isTagged) {
+                            sendTagReminderNotification("development", env.BRANCH_NAME)
+                            // Continue pipeline but don't proceed with promotion
+                            env.BRANCH_COMPLETE = "false"
+                        } else {
+                            echo "Development branch ${env.BRANCH_NAME} is tagged as complete. Ready for promotion."
+                            env.BRANCH_COMPLETE = "true"
+                        }
+                    } else if (env.BRANCH_NAME ==~ env.RELEASE_BRANCH_PATTERN) {
+                        // Check if release branch is tagged as complete
+                        def isTagged = sh(script: "git tag -l | grep '${env.BRANCH_NAME}-complete'", returnStatus: true) == 0
+                        if (!isTagged) {
+                            sendTagReminderNotification("release", env.BRANCH_NAME)
+                            env.BRANCH_COMPLETE = "false"
+                        } else {
+                            echo "Release branch ${env.BRANCH_NAME} is tagged as complete. Ready for promotion."
+                            env.BRANCH_COMPLETE = "true"
+                        }
+                    } else if (env.BRANCH_NAME ==~ env.HOTFIX_BRANCH_PATTERN) {
+                        // Check if hotfix branch is tagged as complete
+                        def isTagged = sh(script: "git tag -l | grep '${env.BRANCH_NAME}-complete'", returnStatus: true) == 0
+                        if (!isTagged) {
+                            sendTagReminderNotification("hotfix", env.BRANCH_NAME)
+                            env.BRANCH_COMPLETE = "false"
+                        } else {
+                            echo "Hotfix branch ${env.BRANCH_NAME} is tagged as complete. Ready for promotion."
+                            env.BRANCH_COMPLETE = "true"
+                        }
+                    } else if (env.BRANCH_NAME == env.MASTER_BRANCH) {
+                        // Master doesn't need a completion tag
+                        env.BRANCH_COMPLETE = "true"
+                    } else {
+                        echo "Branch type not recognized: ${env.BRANCH_NAME}"
+                        env.BRANCH_COMPLETE = "false"
+                    }
+                }
+            }
+        }
+        
+        stage('Branch Processing') {
+            when {
+                expression { return env.BRANCH_COMPLETE == "true" }
+            }
+            steps {
+                script {
+                    if (env.BRANCH_NAME ==~ env.DEV_BRANCH_PATTERN) {
+                        echo "Processing complete development branch: ${env.BRANCH_NAME}"
+                        // Create release branch from development branch
+                        createReleaseFromDev()
+                        
+                    } else if (env.BRANCH_NAME ==~ env.RELEASE_BRANCH_PATTERN) {
+                        echo "Processing complete release branch: ${env.BRANCH_NAME}"
+                        // Merge release to master
+                        mergeReleaseToMaster()
+                        
+                    } else if (env.BRANCH_NAME ==~ env.HOTFIX_BRANCH_PATTERN) {
+                        echo "Processing complete hotfix branch: ${env.BRANCH_NAME}"
+                        // Execute hotfix process
+                        processCompleteHotfix()
+                        
+                    } else if (env.BRANCH_NAME == env.MASTER_BRANCH) {
+                        echo "Processing master branch"
+                        // Master branch specific steps here
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy') {
+            steps {
+                script {
+                    if (env.BRANCH_NAME ==~ env.DEV_BRANCH_PATTERN) {
+                        echo "Deploying to DEV environment"
+                        // Deploy to dev environment
+                        sh """
+                            # Add your dev deployment commands here
+                            echo "Deploying ${env.BRANCH_NAME} to DEV environment"
+                        """
+                    } else if (env.BRANCH_NAME ==~ env.RELEASE_BRANCH_PATTERN) {
+                        echo "Deploying to STAGING/QA environment"
+                        // Deploy to staging/QA environment
+                        sh """
+                            # Add your staging deployment commands here
+                            echo "Deploying ${env.BRANCH_NAME} to STAGING environment"
+                        """
+                    } else if (env.BRANCH_NAME == env.MASTER_BRANCH) {
+                        echo "Production deployment requires manual approval"
+                        // Notify team about pending production deployment
+                        emailext (
+                            subject: "APPROVAL REQUIRED: Production deployment for ${env.BRANCH_NAME}",
+                            body: """
+A merge to master branch has been processed and is ready for production deployment.
+
+To initiate the production deployment, please go to:
+${env.BUILD_URL}input/
+
+This requires manual approval as per company policy.
+                            """,
+                            recipientProviders: [developers(), requestor()]
+                        )
+                        
+                        // Require manual approval for production deployment
+                        input message: 'Deploy to PRODUCTION?', ok: 'Approve Deployment'
+                        
+                        echo "Deploying to PRODUCTION environment"
+                        // Deploy to production environment after approval
+                        sh """
+                            # Add your production deployment commands here
+                            echo "Deploying ${env.BRANCH_NAME} to PRODUCTION environment"
+                        """
+                    } else if (env.BRANCH_NAME ==~ env.HOTFIX_BRANCH_PATTERN) {
+                        echo "Deploying hotfix to TEST environment for verification"
+                        // Deploy to test environment for verification
+                        sh """
+                            # Add your test environment deployment commands here
+                            echo "Deploying ${env.BRANCH_NAME} to TEST environment"
+                        """
+                    } else {
+                        echo "No deployment for branch type: ${env.BRANCH_NAME}"
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+        }
+    }
+}
+
+// Function to send tag reminder notification
+def sendTagReminderNotification(branchType, branchName) {
+    echo "${branchType} branch ${branchName} is not tagged as complete yet. Waiting for explicit completion tag."
+    
+    // Notify team that branch needs to be tagged as complete before proceeding
+    emailext (
+        subject: "ACTION REQUIRED: ${branchType} branch ${branchName} needs completion tag",
+        body: """
+The ${branchType} branch ${branchName} has passed all tests but has not been tagged as complete.
+
+To mark this branch as complete and ready for promotion, please run:
+git checkout ${branchName}
+git tag -a ${branchName}-complete -m "Marking ${branchType} branch as complete and ready for promotion"
+git push origin ${branchName}-complete
+
+The pipeline will automatically detect this tag and proceed with the promotion process.
+        """,
+        recipientProviders: [developers(), requestor()]
+    )
+}
+
+// Function to create a release branch from development
+def createReleaseFromDev() {
+    try {
+        // Extract number from dev branch (e.g., d1 → r1)
+        def devNumber = (env.BRANCH_NAME =~ /d(\d+)/)[0][1]
+        def newReleaseBranch = "r${devNumber}"
+        
+        // Create release branch
+        sh """
+            git checkout ${env.BRANCH_NAME}
+            git checkout -b ${newReleaseBranch}
+            git push origin ${newReleaseBranch}
+        """
+        
+        echo "Created new release branch ${newReleaseBranch} from ${env.BRANCH_NAME}"
+        
+        // Notification about new release branch
+        emailext (
+            subject: "New release branch created: ${newReleaseBranch}",
+            body: "A new release branch ${newReleaseBranch} has been created from development branch ${env.BRANCH_NAME}.",
+            recipientProviders: [developers(), requestor()]
+        )
+    } catch (Exception e) {
+        echo "Failed to create release branch: ${e.message}"
+        throw e
+    }
+}
+
+// Function to merge release to master
+def mergeReleaseToMaster() {
+    try {
+        // Create a release tag
+        def timestamp = new Date().format("yyyyMMdd.HHmmss")
+        def releaseTagName = "release-${env.BRANCH_NAME}-${timestamp}"
+        
+        sh """
+            # Tag the release
+            git checkout ${env.BRANCH_NAME}
+            git tag -a ${releaseTagName} -m "Release tag for ${env.BRANCH_NAME}"
+            git push origin ${releaseTagName}
+            
+            # Merge to master
+            git checkout ${env.MASTER_BRANCH}
+            git pull origin ${env.MASTER_BRANCH}
+            git merge --no-ff origin/${env.BRANCH_NAME} -m "Merge release branch ${env.BRANCH_NAME} to master"
+            git push origin ${env.MASTER_BRANCH}
+        """
+        
+        echo "Release ${env.BRANCH_NAME} successfully tagged as ${releaseTagName} and merged to master"
+        
+        // Notification about successful release
+        emailext (
+            subject: "Release ${env.BRANCH_NAME} deployed to production",
+            body: "Release branch ${env.BRANCH_NAME} has been tagged as ${releaseTagName} and merged to master for production deployment.",
+            recipientProviders: [developers(), requestor()]
+        )
+    } catch (Exception e) {
+        echo "Failed to merge release to master: ${e.message}"
+        throw e
+    }
+}
+
+// Function to process a complete hotfix
+def processCompleteHotfix() {
+    try {
+        // Create a release tag for the hotfix
+        def hotfixName = env.BRANCH_NAME.replaceAll("hotfix/", "")
+        def timestamp = new Date().format("yyyyMMdd.HHmmss")
+        def releaseTagName = "hotfix-${hotfixName}-${timestamp}"
+        
+        sh """
+            # Tag the hotfix for release
+            git checkout ${env.BRANCH_NAME}
+            git tag -a ${releaseTagName} -m "Release tag for hotfix ${env.BRANCH_NAME}"
+            git push origin ${releaseTagName}
+        """
+        
+        echo "Hotfix tagged for release as ${releaseTagName}"
+        
+        // 1. Merge hotfix to release branch
+        sh """
+            # Merge to release branch
+            git checkout ${env.PARENT_RELEASE_BRANCH}
+            git pull origin ${env.PARENT_RELEASE_BRANCH}
+            git merge --no-ff origin/${env.BRANCH_NAME} -m "Merge hotfix ${env.BRANCH_NAME} to ${env.PARENT_RELEASE_BRANCH}"
+            git push origin ${env.PARENT_RELEASE_BRANCH}
+        """
+        
+        echo "Hotfix successfully merged to release branch ${env.PARENT_RELEASE_BRANCH}"
+        
+        // 2. Check if release branch is complete
+        def isReleaseTagged = sh(script: "git tag -l | grep '${env.PARENT_RELEASE_BRANCH}-complete'", returnStatus: true) == 0
+        
+        if (isReleaseTagged) {
+            // If release is already complete, merge to master
+            sh """
+                # Merge release to master
+                git checkout ${env.MASTER_BRANCH}
+                git pull origin ${env.MASTER_BRANCH}
+                git merge --no-ff origin/${env.PARENT_RELEASE_BRANCH} -m "Merge release branch ${env.PARENT_RELEASE_BRANCH} to master"
+                git push origin ${env.MASTER_BRANCH}
+            """
+            
+            echo "Release branch successfully merged to master"
+        } else {
+            echo "Release branch ${env.PARENT_RELEASE_BRANCH} not yet marked as complete. Waiting for release completion tag before merging to master."
+            
+            // Notification that hotfix is merged to release but waiting for release to be complete
+            emailext (
+                subject: "Hotfix merged to release ${env.PARENT_RELEASE_BRANCH} - Awaiting release completion",
+                body: """
+Hotfix ${env.BRANCH_NAME} has been merged to release branch ${env.PARENT_RELEASE_BRANCH}.
+
+The release branch needs to be tagged as complete before it will be merged to master:
+git checkout ${env.PARENT_RELEASE_BRANCH}
+git tag -a ${env.PARENT_RELEASE_BRANCH}-complete -m "Marking release branch as complete and ready for production"
+git push origin ${env.PARENT_RELEASE_BRANCH}-complete
+                """,
+                recipientProviders: [developers(), requestor()]
+            )
+        }
+        
+        // 3. Propagate hotfix to current development branch
+        propagateHotfixToDev()
+        
+    } catch (Exception e) {
+        echo "Failed during hotfix processing: ${e.message}"
+        throw e
+    }
+}
+
+// Function to propagate hotfix to current dev branch
+def propagateHotfixToDev() {
+    try {
+        // Get the commit hash of the hotfix
+        def hotfixCommit = sh(script: "git rev-parse HEAD", returnStdout: true).trim()
+        
+        // Check if there might be merge conflicts before attempting the cherry-pick
+        def mergeCheckOutput = sh(
+            script: """
+                git checkout ${env.CURRENT_DEV_BRANCH}
+                git pull origin ${env.CURRENT_DEV_BRANCH}
+                # Perform a dry-run merge to check for conflicts
+                git merge --no-commit --no-ff ${hotfixCommit} || echo "MERGE_CONFLICT"
+                # Abort the test merge regardless of outcome
+                git merge --abort || true
+            """,
+            returnStdout: true
+        ).trim()
+        
+        if (mergeCheckOutput.contains("MERGE_CONFLICT")) {
+            echo "Potential merge conflicts detected when applying hotfix to ${env.CURRENT_DEV_BRANCH}"
+            
+            // Create a temporary merge branch for the team to resolve conflicts
+            def tempBranchName = "merge-hotfix-to-dev-${env.BUILD_NUMBER}"
+            
+            sh """
+                # Create a temporary branch for conflict resolution
+                git checkout ${env.CURRENT_DEV_BRANCH}
+                git checkout -b ${tempBranchName}
+                
+                # Try to cherry-pick, but it will likely fail due to conflicts
+                git cherry-pick ${hotfixCommit} || true
+            """
+            
+            // Get the list of conflicting files
+            def conflictFiles = sh(
+                script: "git diff --name-only --diff-filter=U || echo 'Unable to determine conflicting files'",
+                returnStdout: true
+            ).trim()
+            
+            // Push the conflict branch for manual resolution
+            sh """
+                # Push the conflict branch
+                git add .
+                git commit -m "WIP: Conflicts merging hotfix to dev" || true
+                git push origin ${tempBranchName}
+            """
+            
+            // Send detailed notification about the conflict
+            emailext (
+                subject: "ATTENTION: Merge conflicts detected applying hotfix to ${env.CURRENT_DEV_BRANCH}",
+                body: """
+Merge conflicts were detected when trying to apply hotfix ${env.BRANCH_NAME} to development branch ${env.CURRENT_DEV_BRANCH}.
+
+A temporary branch '${tempBranchName}' has been created with the conflicts.
+
+Files with conflicts:
+${conflictFiles}
+
+To resolve:
+1. git checkout ${tempBranchName}
+2. Resolve the conflicts in the files listed above
+3. git add [resolved files]
+4. git commit -m "Resolve conflicts merging hotfix to dev"
+5. git push origin ${tempBranchName}
+6. Create a pull request from ${tempBranchName} to ${env.CURRENT_DEV_BRANCH}
+
+This ensures the hotfix changes are properly integrated into the development branch.
+                """,
+                recipientProviders: [developers(), requestor()]
+            )
+            
+            echo "Created conflict resolution branch: ${tempBranchName}"
+            return
+        }
+        
+        // If no conflicts detected, proceed with the cherry-pick
+        sh """
+            git checkout ${env.CURRENT_DEV_BRANCH}
+            git pull origin ${env.CURRENT_DEV_BRANCH}
+            git cherry-pick ${hotfixCommit}
+            git push origin ${env.CURRENT_DEV_BRANCH}
+        """
+        
+        echo "Hotfix successfully propagated to development branch ${env.CURRENT_DEV_BRANCH}"
+        
+        // Notification about successful propagation
+        emailext (
+            subject: "Hotfix propagated to ${env.CURRENT_DEV_BRANCH}",
+            body: "Hotfix has been automatically propagated to the current development branch ${env.CURRENT_DEV_BRANCH}",
+            recipientProviders: [developers(), requestor()]
+        )
+    } catch (Exception e) {
+        echo "Failed to propagate hotfix to dev branch: ${e.message}"
+        echo "Manual intervention required to merge hotfix to development branch"
+        
+        // Notification about failed propagation requiring manual intervention
+        emailext (
+            subject: "ATTENTION: Manual hotfix propagation required to ${env.CURRENT_DEV_BRANCH}",
+            body: "Automatic propagation of hotfix to ${env.CURRENT_DEV_BRANCH} failed. Please merge manually to ensure fixes are included in upcoming releases.\nError: ${e.message}",
+            recipientProviders: [developers(), requestor()]
+        )
+    }
+}
